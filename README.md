@@ -1,3 +1,7 @@
+
+<img width="1536" height="1024" alt="ChatGPT Image 6 de fev  de 2026, 17_55_53" src="https://github.com/user-attachments/assets/0deecabf-a84b-4238-8483-fe355f3d0076" />
+
+
 # Telegram Expense Bot (PT-BR) — Groq + Supabase + Koyeb
 
 Bot de Telegram para registrar despesas a partir de mensagens em português, gerar relatórios (dia/semana) e enviar gráficos de evolução diária. Inclui envio automático de resumo às 23:00 (horário de São Paulo) e um endpoint de health check para manter o serviço vivo em hosting free.
@@ -77,6 +81,9 @@ O parsing do texto é feito via Groq (modelo Llama), retornando **apenas JSON**,
 ### 5) Deploy e healthcheck
 - No Koyeb, o serviço roda como Web Service e expõe `/healthz`
 - UptimeRobot pode pingar `/healthz` para evitar sleep em plano free
+
+![Uploading Gemini_Generated_Image_nkkrcdnkkrcdnkkr.png…]()
+
 
 ---
 
