@@ -179,15 +179,14 @@ def build_report_text(user_id: str) -> str:
 
 def build_daily_chart_png(user_id: str, days: int = 30) -> bytes:
     end = now_local()
-    start = end - timedelta(days=days)
-    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = (end - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    rows = daily_totals_last_n_days(user_id, days=days + 2, start_dt=start, end_dt=end)
+    rows = daily_totals_last_n_days(user_id, days=days + 5, start_dt=start, end_dt=end)
 
     # mapa dia -> total
     totals_by_day = {r[0].date(): float(r[1] or 0) for r in rows}
 
-    # série completa (para linha contínua)
+    # série completa (linha contínua)
     x_all = []
     y_all = []
     cur = start.date()
@@ -196,81 +195,84 @@ def build_daily_chart_png(user_id: str, days: int = 30) -> bytes:
         y_all.append(totals_by_day.get(cur, 0.0))
         cur = cur + timedelta(days=1)
 
-    # apenas dias com gasto (para marcadores e rótulos)
+    # pontos com gasto (para marcadores)
     x_pts = [d for d in x_all if totals_by_day.get(d, 0.0) > 0]
     y_pts = [totals_by_day[d] for d in x_pts]
 
-    def brl(v: float) -> str:
+    def fmt_brl(v: float) -> str:
         s = f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
         return f"R$ {s}"
 
-    # ---- gráfico ----
-    fig, ax = plt.subplots(figsize=(10, 4))
+    # --------- escolhe escala Y automaticamente ----------
+    positives = sorted([v for v in y_all if v > 0])
+    use_symlog = False
+    linthresh = 10  # até R$10 fica "linear" (ajuste se quiser)
+    if positives:
+        # Se o maior for muito maior que a mediana, tem "pico"
+        median = positives[len(positives) // 2]
+        vmax = positives[-1]
+        if median > 0 and (vmax / median) >= 8:
+            use_symlog = True
 
-    # Linha completa (inclui zeros)
-    ax.plot(x_all, y_all, marker=None)
+    fig, ax = plt.subplots(figsize=(12, 4.5))
 
-    # Marcadores só nos dias com gasto
+    # Linha
+    ax.plot(x_all, y_all, linewidth=2)
+
+    # Marcadores só onde tem gasto
     if x_pts:
-        ax.plot(x_pts, y_pts, linestyle="None", marker="o")
+        ax.plot(x_pts, y_pts, linestyle="None", marker="o", markersize=5)
 
-        # rótulos nos pontos
-        for xd, yd in zip(x_pts, y_pts):
-            ax.annotate(
-                brl(yd),
-                (xd, yd),
-                textcoords="offset points",
-                xytext=(0, 8),
-                ha="center",
-                fontsize=9,
-            )
+    # Formatação BRL no eixo Y
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: fmt_brl(x)))
 
     ax.set_title(f"Gastos por dia (últimos {days} dias)")
-    ax.set_xlabel("Dia (dd/mm)")
+    ax.set_xlabel("Dia")
     ax.set_ylabel("Valor (R$)")
     ax.grid(True, axis="y", linestyle="--", linewidth=0.7, alpha=0.6)
 
-    # X em PT-BR: ticks semanais (ou ~6-8 marcas)
-    # Se days=30 => a cada 5 dias fica bom
-    step = 5 if days >= 25 else 2
-    tick_dates = x_all[::step]
-    ax.set_xticks(tick_dates)
-    ax.set_xticklabels([d.strftime("%d/%m") for d in tick_dates], rotation=0)
+    # Eixo X: datas legíveis (sem colar)
+    locator = mdates.AutoDateLocator(minticks=5, maxticks=8)
+    formatter = mdates.ConciseDateFormatter(locator)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(formatter)
+    fig.autofmt_xdate(rotation=0)
 
-    # ------ Melhor visualização com pico ------
-    # Se existe 1 pico muito alto, o resto some.
-    # Estratégia: limitar o topo do eixo para mostrar o "miolo"
-    # e ainda não cortar o pico: colocamos um teto baseado em percentil.
-    USE_LOG = False  # se quiser, troca pra True
-
-    if USE_LOG:
-        ax.set_yscale("log")
-        # evita log(0): soma 1 centavo pra zeros
-        # (se quiser, eu te mando a versão log bem certinha)
+    # Escala "symlog" se houver pico (melhor visualização)
+    if use_symlog:
+        ax.set_yscale("symlog", linthresh=linthresh)
+        ax.text(
+            0.99, 0.95,
+            f"Escala ajustada (symlog) p/ mostrar picos",
+            transform=ax.transAxes,
+            ha="right", va="top",
+            fontsize=9,
+        )
     else:
-        positives = [v for v in y_all if v > 0]
+        # sem pico: usa limite confortável
         if positives:
-            positives_sorted = sorted(positives)
-            p90 = positives_sorted[int(0.90 * (len(positives_sorted) - 1))]
-            ymax = max(p90 * 1.8, max(positives) * 0.6)
-            # se não tiver outlier, ymax vira o max normal
-            if ymax < max(positives) * 0.95:
-                # tem outlier forte; usa o zoom (miolo)
-                ax.set_ylim(0, ymax)
-
-                # avisa no gráfico que existe pico maior
-                ax.text(
-                    0.99, 0.95,
-                    "Obs.: eixo Y ajustado (há pico acima do limite)",
-                    transform=ax.transAxes,
-                    ha="right",
-                    va="top",
-                    fontsize=9,
-                )
-            else:
-                ax.set_ylim(0, max(positives) * 1.15)
+            ax.set_ylim(0, positives[-1] * 1.15)
         else:
             ax.set_ylim(0, 1)
+
+    # Rótulos: só nos pontos mais relevantes (pra não poluir)
+    # - mostra no máximo 6 rótulos
+    # - prioriza valores maiores
+    if x_pts:
+        pairs = list(zip(x_pts, y_pts))
+        pairs_sorted = sorted(pairs, key=lambda t: t[1], reverse=True)
+        to_label = pairs_sorted[:6]
+
+        for xd, yd in to_label:
+            ax.annotate(
+                fmt_brl(yd),
+                (xd, yd),
+                textcoords="offset points",
+                xytext=(0, 10),
+                ha="center",
+                fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.8),
+            )
 
     fig.tight_layout()
 
@@ -318,6 +320,18 @@ async def grafico(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     png = build_daily_chart_png(user_id, days=30)
     await safe_send_photo(context, update.effective_chat.id, png, caption="📈 Gastos por dia (30 dias)")
+async def teste23(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Dispara manualmente o mesmo relatório automático das 23:00 (pra teste).
+    """
+    user_id = str(update.effective_user.id)
+    chat_id = update.effective_chat.id
+
+    text = build_report_text(user_id)
+    await safe_send_markdown(context, chat_id, "🧪 *Teste do relatório (simulando 23:00)*\n" + text)
+
+    png = build_daily_chart_png(user_id, days=30)
+    await safe_send_photo(context, chat_id, png, caption="📈 Gráfico (30 dias) — teste")
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text_in = update.message.text or ""
@@ -343,7 +357,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 confidence=float(obj.get("confidence") or 0),
             )
 
-            reply = reply + f"\nID: `{expense_id}`"
+            reply = reply
 
     except httpx.HTTPStatusError as e:
         reply = f"Erro na Groq (status {e.response.status_code}).\nTrecho: {e.response.text[:300]}"
@@ -399,6 +413,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("relatorio", relatorio))
     app.add_handler(CommandHandler("grafico", grafico))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(CommandHandler("teste23", teste23))
 
     app.add_error_handler(on_error)
 
