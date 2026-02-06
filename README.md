@@ -82,7 +82,7 @@ O parsing do texto é feito via Groq (modelo Llama), retornando **apenas JSON**,
 - No Koyeb, o serviço roda como Web Service e expõe `/healthz`
 - UptimeRobot pode pingar `/healthz` para evitar sleep em plano free
 
-![Uploading Gemini_Generated_Image_nkkrcdnkkrcdnkkr.png…]()
+<img width="2816" height="1536" alt="Gemini_Generated_Image_nkkrcdnkkrcdnkkr" src="https://github.com/user-attachments/assets/8e4aa545-c22e-4947-80d3-5e1e4514553e" />
 
 
 ---
