@@ -418,7 +418,7 @@ def start_health_server():
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    start_health_server()git add .
+    start_health_server()
     backoffs = [2, 5, 10, 20]
     i = 0
 
