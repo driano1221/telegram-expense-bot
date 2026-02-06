@@ -429,11 +429,21 @@ def start_health_server():
     port = int(os.getenv("PORT", "8080"))
 
     class Handler(BaseHTTPRequestHandler):
+        def _send_ok_headers(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+
+        def do_HEAD(self):
+            if self.path in ("/", "/healthz"):
+                self._send_ok_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
+
         def do_GET(self):
             if self.path in ("/", "/healthz"):
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.end_headers()
+                self._send_ok_headers()
                 self.wfile.write(b"ok")
             else:
                 self.send_response(404)
@@ -446,6 +456,7 @@ def start_health_server():
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     print(f"Health server em http://0.0.0.0:{port}/healthz")
+
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
