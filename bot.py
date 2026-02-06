@@ -31,8 +31,10 @@ from db import (
     totals_by_category,
     totals_overall,
     daily_totals_last_n_days,
-    list_users_with_expenses
-)  # noqa: E402
+    list_users_with_expenses,
+    get_chat_id_for_user,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -328,8 +330,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if obj.get("amount") is not None:
             user_id = str(update.effective_user.id)
+            chat_id = str(update.effective_chat.id)
+
             expense_id = insert_expense(
                 user_id=user_id,
+                chat_id=chat_id,
                 raw_text=text_in,
                 amount=obj.get("amount"),
                 currency=obj.get("currency") or "BRL",
@@ -337,6 +342,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 description=obj.get("description") or "",
                 confidence=float(obj.get("confidence") or 0),
             )
+
             reply = reply + f"\nID: `{expense_id}`"
 
     except httpx.HTTPStatusError as e:
@@ -352,14 +358,23 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def scheduled_23h(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Envia automaticamente às 23:00 um resumo do dia + semana.
-    (Para cada user_id que já tenha gasto registrado)
+    (Para cada user_id que já tenha chat_id salvo)
     """
-    user_ids = list_users_with_expenses()
+    user_ids = list_users_with_expenses(only_with_chat_id=True)
+
     for uid in user_ids:
         try:
-            chat_id = int(uid)  # aqui estamos assumindo user_id = telegram user id
+            chat_id = get_chat_id_for_user(uid)
+            if not chat_id:
+                logger.warning("Usuário %s sem chat_id salvo. Pulando.", uid)
+                continue
+
             text = build_report_text(uid)
-            await safe_send_markdown(context, chat_id, "🕚 *Relatório automático (23:00)*\n" + text)
+            await safe_send_markdown(
+                context,
+                chat_id,
+                "🕚 *Relatório automático (23:00)*\n" + text
+            )
 
             # opcional: manda gráfico também
             png = build_daily_chart_png(uid, days=30)
@@ -367,6 +382,7 @@ async def scheduled_23h(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         except Exception as e:
             logger.exception("Falha ao enviar relatório automático para %s: %s", uid, e)
+
 
 def build_app() -> Application:
     request = HTTPXRequest(
