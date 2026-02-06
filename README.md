@@ -2,7 +2,7 @@
 <img width="1536" height="1024" alt="ChatGPT Image 6 de fev  de 2026, 17_55_53" src="https://github.com/user-attachments/assets/0deecabf-a84b-4238-8483-fe355f3d0076" />
 
 
-# Telegram Expense Bot (PT-BR) — Groq + Supabase + Koyeb
+# Telegram Expense Bot (PT-BR) — Groq + Supabase + Koyeb (Totalmente Gratuíto)
 
 Bot de Telegram para registrar despesas a partir de mensagens em português, gerar relatórios (dia/semana) e enviar gráficos de evolução diária. Inclui envio automático de resumo às 23:00 (horário de São Paulo) e um endpoint de health check para manter o serviço vivo em hosting free.
 
