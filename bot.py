@@ -5,7 +5,6 @@ import logging
 from collections import defaultdict
 from io import BytesIO
 from datetime import datetime, timedelta
-import pytz
 import matplotlib.dates as mdates
 from matplotlib.ticker import FuncFormatter
 import time
@@ -39,13 +38,21 @@ from db import (
     list_users_with_expenses,
     get_chat_id_for_user,
 )
+from utils import (
+    TZ,
+    CATEGORY_EMOJI,
+    now_local,
+    day_range_local,
+    week_range_local,
+    format_brl,
+    format_reply,
+)
 
 
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-TZ = pytz.timezone("America/Sao_Paulo")
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Faltou TELEGRAM_BOT_TOKEN no .env")
@@ -105,26 +112,6 @@ Regras:
 - currency sempre "BRL".
 """
 
-def now_local() -> datetime:
-    return datetime.now(TZ)
-
-def day_range_local(d: datetime):
-    start = d.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=1)
-    return start, end
-
-def week_range_local(d: datetime):
-    # Semana começando na segunda (0)
-    start = d.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=d.weekday())
-    end = start + timedelta(days=7)
-    return start, end
-
-def format_brl(amount) -> str:
-    try:
-        amount_f = float(amount)
-        return f"R$ {amount_f:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
-        return f"R$ {amount}"
 
 async def extract_expense(text: str) -> dict:
     payload = {
@@ -149,51 +136,6 @@ async def extract_expense(text: str) -> dict:
 
     content = data["choices"][0]["message"]["content"]
     return json.loads(content)
-
-CATEGORY_EMOJI = {
-    "alimentacao": "🍔",
-    "transporte": "🚗",
-    "saude": "💊",
-    "lazer": "🎮",
-    "casa": "🏠",
-    "salario": "💼",
-    "freelance": "💻",
-    "investimento": "📈",
-    "outros": "📦",
-}
-
-def format_reply(obj: dict) -> str:
-    amount = obj.get("amount")
-    category = obj.get("category", "outros")
-    entry_type = obj.get("type", "expense")
-    desc = (obj.get("description") or "").strip() or ("Gasto" if entry_type == "expense" else "Ganho")
-    conf = float(obj.get("confidence") or 0)
-    emoji = CATEGORY_EMOJI.get(category, "📦")
-
-    if amount is None:
-        return (
-            "😅 <b>Não entendi</b>\n\n"
-            "Tenta algo como:\n"
-            "  <code>gastei 50 no uber</code>\n"
-            "  <code>recebi 3000 de salario</code>"
-        )
-
-    if entry_type == "income":
-        return (
-            f"🟢 <b>Ganho registrado!</b>\n"
-            f"\n"
-            f"💰 Valor: <b>{format_brl(amount)}</b>\n"
-            f"{emoji} Categoria: <b>{category}</b>\n"
-            f"📝 Descrição: <i>{desc}</i>"
-        )
-
-    return (
-        f"🔴 <b>Gasto registrado!</b>\n"
-        f"\n"
-        f"💰 Valor: <b>{format_brl(amount)}</b>\n"
-        f"{emoji} Categoria: <b>{category}</b>\n"
-        f"📝 Descrição: <i>{desc}</i>"
-    )
 
 async def safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
     for attempt, delay in enumerate([1, 2, 4], start=1):
