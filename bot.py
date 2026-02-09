@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 import httpx
 import matplotlib.pyplot as plt
+import numpy as np
 
 from telegram import Update
 from telegram.ext import (
@@ -29,9 +30,12 @@ load_dotenv()
 from db import (
     insert_expense,
     list_last_expenses,
+    list_last_entries,
     totals_by_category,
     totals_overall,
     daily_totals_last_n_days,
+    monthly_balance,
+    weekly_balance_last_n_weeks,
     list_users_with_expenses,
     get_chat_id_for_user,
 )
@@ -83,17 +87,20 @@ MAX_TEXT_LENGTH = 500
 MAX_AMOUNT = 1_000_000  # R$ 1 milhão
 
 SYSTEM_PROMPT = """
-Você é um extrator de despesas em português do Brasil.
+Você é um extrator de despesas e ganhos financeiros em português do Brasil.
 Dada uma mensagem, devolva APENAS um JSON válido (sem texto extra) com:
 {
+  "type": "expense" | "income",
   "amount": number | null,
   "currency": "BRL",
-  "category": "alimentacao"|"transporte"|"saude"|"lazer"|"casa"|"outros",
+  "category": "alimentacao"|"transporte"|"saude"|"lazer"|"casa"|"salario"|"freelance"|"investimento"|"outros",
   "description": string,
   "confidence": number
 }
 Regras:
-- Se não houver gasto claro, amount=null, category="outros" e confidence baixa.
+- Se a mensagem indicar dinheiro RECEBIDO (salário, pagamento, venda, freelance, transferência recebida, investimento), type="income".
+- Se a mensagem indicar dinheiro GASTO (compra, pagamento de conta, despesa), type="expense".
+- Se não houver valor claro, amount=null, category="outros" e confidence baixa.
 - description deve ser curta (2 a 6 palavras).
 - currency sempre "BRL".
 """
@@ -149,26 +156,39 @@ CATEGORY_EMOJI = {
     "saude": "💊",
     "lazer": "🎮",
     "casa": "🏠",
+    "salario": "💼",
+    "freelance": "💻",
+    "investimento": "📈",
     "outros": "📦",
 }
 
 def format_reply(obj: dict) -> str:
     amount = obj.get("amount")
     category = obj.get("category", "outros")
-    desc = (obj.get("description") or "").strip() or "Gasto"
+    entry_type = obj.get("type", "expense")
+    desc = (obj.get("description") or "").strip() or ("Gasto" if entry_type == "expense" else "Ganho")
     conf = float(obj.get("confidence") or 0)
     emoji = CATEGORY_EMOJI.get(category, "📦")
 
     if amount is None:
         return (
-            "😅 <b>Não entendi como gasto</b>\n\n"
+            "😅 <b>Não entendi</b>\n\n"
             "Tenta algo como:\n"
             "  <code>gastei 50 no uber</code>\n"
-            "  <code>almocei 35 reais</code>"
+            "  <code>recebi 3000 de salario</code>"
+        )
+
+    if entry_type == "income":
+        return (
+            f"🟢 <b>Ganho registrado!</b>\n"
+            f"\n"
+            f"💰 Valor: <b>{format_brl(amount)}</b>\n"
+            f"{emoji} Categoria: <b>{category}</b>\n"
+            f"📝 Descrição: <i>{desc}</i>"
         )
 
     return (
-        f"✅ <b>Gasto registrado!</b>\n"
+        f"🔴 <b>Gasto registrado!</b>\n"
         f"\n"
         f"💰 Valor: <b>{format_brl(amount)}</b>\n"
         f"{emoji} Categoria: <b>{category}</b>\n"
@@ -382,17 +402,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_user.id):
         return
     msg = (
-        "👋 <b>Olá! Eu sou seu bot de despesas.</b>\n"
+        "👋 <b>Olá! Eu sou seu bot de finanças.</b>\n"
         "\n"
         "Me manda uma frase tipo:\n"
         "  <code>gastei 50 no uber</code>\n"
         "  <code>almocei 35 reais</code>\n"
-        "  <code>comprei remédio 120</code>\n"
+        "  <code>recebi 3000 de salario</code>\n"
         "\n"
         "📋 <b>Comandos:</b>\n"
         "  /gastos — últimos 10 gastos\n"
+        "  /ganhos — últimos 10 ganhos\n"
         "  /relatorio — resumo hoje + semana\n"
-        "  /grafico — gráfico últimos 30 dias"
+        "  /saldo — saldo do mês\n"
+        "  /grafico — gráfico de gastos (30 dias)\n"
+        "  /balanco — gráfico gastos x ganhos"
     )
     await safe_send(context, update.effective_chat.id, msg)
 
@@ -447,6 +470,181 @@ async def teste23(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     png = build_daily_chart_png(user_id, days=30)
     await safe_send_photo(context, chat_id, png, caption="📈 Gráfico (30 dias) — teste")
 
+async def ganhos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = str(update.effective_user.id)
+    rows = list_last_entries(user_id, entry_type="income", limit=10)
+
+    if not rows:
+        await safe_send(context, update.effective_chat.id, "📭 <i>Nenhum ganho registrado ainda.</i>")
+        return
+
+    lines = ["💚 <b>Últimos ganhos</b>\n"]
+    for i, (created_at, amount, currency, category, description) in enumerate(rows, 1):
+        dt = str(created_at)[:16].replace("T", " ")
+        emoji = CATEGORY_EMOJI.get(category, "📦")
+        lines.append(
+            f"{i}. {emoji} <b>{format_brl(amount)}</b> — {category}\n"
+            f"     <i>{description}</i>\n"
+            f"     🕐 <code>{dt}</code>"
+        )
+        if i < len(rows):
+            lines.append("")
+
+    await safe_send(context, update.effective_chat.id, "\n".join(lines))
+
+
+async def saldo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = str(update.effective_user.id)
+
+    d0 = now_local()
+    # Mes atual: dia 1 ate agora
+    m_start = d0.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    m_end = d0 + timedelta(days=1)
+
+    total_gastos, n_gastos, total_ganhos, n_ganhos = monthly_balance(user_id, m_start, m_end)
+    saldo_val = float(total_ganhos) - float(total_gastos)
+
+    if saldo_val >= 0:
+        saldo_icon = "🟢"
+        saldo_label = "positivo"
+    else:
+        saldo_icon = "🔴"
+        saldo_label = "negativo"
+
+    mes_nome = d0.strftime("%B/%Y").capitalize()
+
+    text = (
+        f"💰 <b>Saldo de {mes_nome}</b>\n"
+        f"\n"
+        f"🟢 Ganhos: <b>{format_brl(total_ganhos)}</b>  ({n_ganhos} registro(s))\n"
+        f"🔴 Gastos: <b>{format_brl(total_gastos)}</b>  ({n_gastos} registro(s))\n"
+        f"\n"
+        f"─────────────────────\n"
+        f"\n"
+        f"{saldo_icon} Saldo: <b>{format_brl(abs(saldo_val))}</b> {saldo_label}"
+    )
+    await safe_send(context, update.effective_chat.id, text)
+
+
+def build_balance_chart_png(user_id: str, weeks: int = 8) -> bytes:
+    """Grafico de barras: gastos x ganhos por semana + linha de saldo."""
+    end = now_local()
+    start = (end - timedelta(weeks=weeks)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    rows = weekly_balance_last_n_weeks(user_id, weeks=weeks + 2, start_dt=start, end_dt=end)
+
+    week_labels = []
+    expenses = []
+    incomes = []
+    for row in rows:
+        week_labels.append(row[0].strftime("%d/%m"))
+        expenses.append(float(row[1] or 0))
+        incomes.append(float(row[2] or 0))
+
+    # Cores
+    COLOR_EXPENSE = "#EF4444"
+    COLOR_INCOME = "#22C55E"
+    COLOR_BALANCE = "#2563EB"
+    COLOR_GRID = "#E5E7EB"
+    COLOR_TEXT = "#374151"
+    BG_COLOR = "#FAFBFC"
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    fig.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+
+    if not week_labels:
+        ax.text(0.5, 0.5, "Sem dados ainda", ha="center", va="center",
+                fontsize=14, color=COLOR_TEXT, transform=ax.transAxes)
+        bio = BytesIO()
+        fig.savefig(bio, format="png", dpi=180, facecolor=BG_COLOR)
+        plt.close(fig)
+        return bio.getvalue()
+
+    x = np.arange(len(week_labels))
+    width = 0.35
+
+    # Barras
+    bars_exp = ax.bar(x - width/2, expenses, width, label="Gastos", color=COLOR_EXPENSE, alpha=0.85, zorder=3)
+    bars_inc = ax.bar(x + width/2, incomes, width, label="Ganhos", color=COLOR_INCOME, alpha=0.85, zorder=3)
+
+    # Linha de saldo
+    balances = [inc - exp for inc, exp in zip(incomes, expenses)]
+    ax.plot(x, balances, color=COLOR_BALANCE, linewidth=2.5, marker="o", markersize=6,
+            label="Saldo", zorder=4, markeredgecolor="white", markeredgewidth=1.5)
+
+    # Rotulos nas barras
+    for bar in bars_exp:
+        h = bar.get_height()
+        if h > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, h, format_brl(h),
+                    ha="center", va="bottom", fontsize=7, color=COLOR_EXPENSE, fontweight="bold")
+
+    for bar in bars_inc:
+        h = bar.get_height()
+        if h > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, h, format_brl(h),
+                    ha="center", va="bottom", fontsize=7, color=COLOR_INCOME, fontweight="bold")
+
+    # Rotulos de saldo
+    for i, bal in enumerate(balances):
+        offset = 12 if bal >= 0 else -12
+        ax.annotate(
+            format_brl(bal),
+            (x[i], bal),
+            textcoords="offset points", xytext=(0, offset),
+            ha="center", fontsize=7, fontweight="bold", color=COLOR_BALANCE,
+        )
+
+    # Estilo
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"Sem.\n{l}" for l in week_labels], fontsize=8)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, pos: format_brl(v)))
+    ax.axhline(y=0, color=COLOR_GRID, linewidth=1, zorder=1)
+    ax.grid(True, axis="y", linestyle="-", linewidth=0.5, color=COLOR_GRID, alpha=0.8)
+    ax.grid(False, axis="x")
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.spines["bottom"].set_color(COLOR_GRID)
+    ax.tick_params(axis="both", which="both", length=0, labelcolor=COLOR_TEXT, labelsize=9)
+
+    ax.set_title(
+        f"Gastos x Ganhos — ultimas {weeks} semanas",
+        fontsize=14, fontweight="bold", color=COLOR_TEXT, pad=16, loc="left",
+    )
+
+    ax.legend(loc="upper left", frameon=False, fontsize=10)
+
+    # Resumo
+    total_exp = sum(expenses)
+    total_inc = sum(incomes)
+    saldo_total = total_inc - total_exp
+    resumo = f"Total gastos: {format_brl(total_exp)}   |   Total ganhos: {format_brl(total_inc)}   |   Saldo: {format_brl(saldo_total)}"
+    fig.text(0.5, 0.01, resumo, ha="center", fontsize=9, color=COLOR_TEXT, alpha=0.7, style="italic")
+
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.15)
+
+    bio = BytesIO()
+    fig.savefig(bio, format="png", dpi=180, facecolor=BG_COLOR, edgecolor="none")
+    plt.close(fig)
+    return bio.getvalue()
+
+
+async def balanco(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = str(update.effective_user.id)
+    png = build_balance_chart_png(user_id, weeks=8)
+    await safe_send_photo(context, update.effective_chat.id, png, caption="📊 Gastos x Ganhos (8 semanas)")
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text_in = update.message.text or ""
     if not text_in.strip():
@@ -497,6 +695,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             user_id = str(uid)
             chat_id = str(update.effective_chat.id)
 
+            entry_type = obj.get("type", "expense")
+            if entry_type not in ("expense", "income"):
+                entry_type = "expense"
+
             insert_expense(
                 user_id=user_id,
                 chat_id=chat_id,
@@ -506,6 +708,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 category=obj.get("category") or "outros",
                 description=obj.get("description") or "",
                 confidence=float(obj.get("confidence") or 0),
+                entry_type=entry_type,
             )
 
     except httpx.HTTPStatusError as e:
@@ -559,7 +762,10 @@ def build_app() -> Application:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("gastos", gastos))
+    app.add_handler(CommandHandler("ganhos", ganhos))
     app.add_handler(CommandHandler("relatorio", relatorio))
+    app.add_handler(CommandHandler("saldo", saldo))
+    app.add_handler(CommandHandler("balanco", balanco))
     app.add_handler(CommandHandler("grafico", grafico))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CommandHandler("teste23", teste23))
