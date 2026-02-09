@@ -143,21 +143,42 @@ async def extract_expense(text: str) -> dict:
     content = data["choices"][0]["message"]["content"]
     return json.loads(content)
 
+CATEGORY_EMOJI = {
+    "alimentacao": "🍔",
+    "transporte": "🚗",
+    "saude": "💊",
+    "lazer": "🎮",
+    "casa": "🏠",
+    "outros": "📦",
+}
+
 def format_reply(obj: dict) -> str:
     amount = obj.get("amount")
     category = obj.get("category", "outros")
     desc = (obj.get("description") or "").strip() or "Gasto"
     conf = float(obj.get("confidence") or 0)
+    emoji = CATEGORY_EMOJI.get(category, "📦")
 
     if amount is None:
-        return f"Não entendi como gasto 😅\nTenta: `gastei 50 no uber` (conf={conf:.2f})"
+        return (
+            "😅 <b>Não entendi como gasto</b>\n\n"
+            "Tenta algo como:\n"
+            "  <code>gastei 50 no uber</code>\n"
+            "  <code>almocei 35 reais</code>"
+        )
 
-    return f"✅ {format_brl(amount)} em *{category}* — {desc}"
+    return (
+        f"✅ <b>Gasto registrado!</b>\n"
+        f"\n"
+        f"💰 Valor: <b>{format_brl(amount)}</b>\n"
+        f"{emoji} Categoria: <b>{category}</b>\n"
+        f"📝 Descrição: <i>{desc}</i>"
+    )
 
-async def safe_send_markdown(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+async def safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
     for attempt, delay in enumerate([1, 2, 4], start=1):
         try:
-            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
             return
         except (NetworkError, TimedOut) as e:
             logger.warning("Falha ao enviar msg (tentativa %s): %s", attempt, e)
@@ -192,20 +213,32 @@ def build_report_text(user_id: str) -> str:
     week_rows = totals_by_category(user_id, w_start, w_end)
 
     lines = []
-    lines.append(f"📅 *Hoje* ({d_start.strftime('%d/%m')}): {format_brl(day_total)} em {day_n} gasto(s)")
+
+    # ── Hoje ──
+    lines.append(f"📅 <b>Hoje</b> ({d_start.strftime('%d/%m')})")
+    lines.append(f"    💰 Total: <b>{format_brl(day_total)}</b>  •  {day_n} gasto(s)")
+    lines.append("")
     if day_rows:
         for cat, total, n in day_rows[:8]:
-            lines.append(f"  • {cat}: {format_brl(total)} ({n})")
+            emoji = CATEGORY_EMOJI.get(cat, "📦")
+            lines.append(f"    {emoji} {cat}: <code>{format_brl(total)}</code> ({n})")
     else:
-        lines.append("  • (sem gastos hoje)")
+        lines.append("    <i>Nenhum gasto hoje</i>")
 
     lines.append("")
-    lines.append(f"🗓️ *Semana* (desde {w_start.strftime('%d/%m')}): {format_brl(week_total)} em {week_n} gasto(s)")
+    lines.append("─────────────────────")
+    lines.append("")
+
+    # ── Semana ──
+    lines.append(f"🗓 <b>Semana</b> (desde {w_start.strftime('%d/%m')})")
+    lines.append(f"    💰 Total: <b>{format_brl(week_total)}</b>  •  {week_n} gasto(s)")
+    lines.append("")
     if week_rows:
         for cat, total, n in week_rows[:8]:
-            lines.append(f"  • {cat}: {format_brl(total)} ({n})")
+            emoji = CATEGORY_EMOJI.get(cat, "📦")
+            lines.append(f"    {emoji} {cat}: <code>{format_brl(total)}</code> ({n})")
     else:
-        lines.append("  • (sem gastos na semana)")
+        lines.append("    <i>Nenhum gasto na semana</i>")
 
     return "\n".join(lines)
 
@@ -329,7 +362,6 @@ def build_daily_chart_png(user_id: str, days: int = 30) -> bytes:
         f"Total: {format_brl(total)}"
         f"   |   Media/dia: {format_brl(media)}"
         f"   |   Maior gasto: {format_brl(maior)}"
-        f"   |   Dias com gasto: {dias_com_gasto}/{len(x_all)}"
     )
     fig.text(
         0.5, 0.01, resumo,
@@ -350,16 +382,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_user.id):
         return
     msg = (
-        "Olá! Me manda uma frase tipo:\n"
-        "- gastei 50 no uber\n"
-        "- almocei 35 reais\n"
-        "- comprei remédio 120\n\n"
-        "Comandos:\n"
-        "/gastos — últimos 10\n"
-        "/relatorio — resumo hoje + semana\n"
-        "/grafico — gráfico últimos 30 dias"
+        "👋 <b>Olá! Eu sou seu bot de despesas.</b>\n"
+        "\n"
+        "Me manda uma frase tipo:\n"
+        "  <code>gastei 50 no uber</code>\n"
+        "  <code>almocei 35 reais</code>\n"
+        "  <code>comprei remédio 120</code>\n"
+        "\n"
+        "📋 <b>Comandos:</b>\n"
+        "  /gastos — últimos 10 gastos\n"
+        "  /relatorio — resumo hoje + semana\n"
+        "  /grafico — gráfico últimos 30 dias"
     )
-    await safe_send_markdown(context, update.effective_chat.id, msg)
+    await safe_send(context, update.effective_chat.id, msg)
 
 async def gastos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_user.id):
@@ -368,23 +403,29 @@ async def gastos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows = list_last_expenses(user_id=user_id, limit=10)
 
     if not rows:
-        await safe_send_markdown(context, update.effective_chat.id, "Ainda não tem gastos salvos.")
+        await safe_send(context, update.effective_chat.id, "📭 <i>Nenhum gasto registrado ainda.</i>")
         return
 
-    lines = []
-    for created_at, amount, currency, category, description in rows:
-        dt = str(created_at)[:19].replace("T", " ")
-        amt = f"{amount}".replace(".", ",") if amount is not None else "—"
-        lines.append(f"{dt} — R$ {amt} — {category} — {description}")
+    lines = ["📋 <b>Últimos gastos</b>\n"]
+    for i, (created_at, amount, currency, category, description) in enumerate(rows, 1):
+        dt = str(created_at)[:16].replace("T", " ")
+        emoji = CATEGORY_EMOJI.get(category, "📦")
+        lines.append(
+            f"{i}. {emoji} <b>{format_brl(amount)}</b> — {category}\n"
+            f"     <i>{description}</i>\n"
+            f"     🕐 <code>{dt}</code>"
+        )
+        if i < len(rows):
+            lines.append("")
 
-    await safe_send_markdown(context, update.effective_chat.id, "\n".join(lines))
+    await safe_send(context, update.effective_chat.id, "\n".join(lines))
 
 async def relatorio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_user.id):
         return
     user_id = str(update.effective_user.id)
     text = build_report_text(user_id)
-    await safe_send_markdown(context, update.effective_chat.id, text)
+    await safe_send(context, update.effective_chat.id, text)
 
 async def grafico(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_user.id):
@@ -401,7 +442,7 @@ async def teste23(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
 
     text = build_report_text(user_id)
-    await safe_send_markdown(context, chat_id, "🧪 *Teste do relatório (simulando 23:00)*\n" + text)
+    await safe_send(context, chat_id, "🧪 <b>Teste do relatório (simulando 23:00)</b>\n\n" + text)
 
     png = build_daily_chart_png(user_id, days=30)
     await safe_send_photo(context, chat_id, png, caption="📈 Gráfico (30 dias) — teste")
@@ -419,7 +460,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ── Rate limiting ──
     if is_rate_limited(uid):
-        await safe_send_markdown(
+        await safe_send(
             context, update.effective_chat.id,
             "⏳ Calma! Limite de mensagens atingido. Tente novamente em alguns segundos.",
         )
@@ -427,7 +468,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ── Validacao de tamanho ──
     if len(text_in) > MAX_TEXT_LENGTH:
-        await safe_send_markdown(
+        await safe_send(
             context, update.effective_chat.id,
             f"Mensagem muito longa ({len(text_in)} chars). Máximo: {MAX_TEXT_LENGTH}.",
         )
@@ -472,7 +513,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         reply = f"Deu erro: {type(e).__name__}: {e}"
 
-    await safe_send_markdown(context, update.effective_chat.id, reply)
+    await safe_send(context, update.effective_chat.id, reply)
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Erro no handler: %s", context.error)
@@ -492,10 +533,10 @@ async def scheduled_23h(context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
 
             text = build_report_text(uid)
-            await safe_send_markdown(
+            await safe_send(
                 context,
                 chat_id,
-                "🕚 *Relatório automático (23:00)*\n" + text
+                "🕚 <b>Relatório automático (23:00)</b>\n\n" + text
             )
 
             # opcional: manda gráfico também
