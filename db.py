@@ -23,18 +23,21 @@ def insert_expense(
     user_id: str,
     chat_id: str | None = None,
     raw_text: str,
-    amount,
+    amount: float,
     currency: str,
     category: str,
     description: str,
     confidence: float,
+    entry_type: str = "expense",
 ):
     """
-    Salva uma despesa. Se chat_id vier preenchido, guarda também para relatórios automáticos.
+    Salva uma despesa ou ganho. entry_type: 'expense' ou 'income'.
     """
     q = text("""
-        insert into public.expenses (user_id, chat_id, raw_text, amount, currency, category, description, confidence)
-        values (:user_id, :chat_id, :raw_text, :amount, :currency, :category, :description, :confidence)
+        insert into public.expenses
+            (user_id, chat_id, raw_text, amount, currency, category, description, confidence, type)
+        values
+            (:user_id, :chat_id, :raw_text, :amount, :currency, :category, :description, :confidence, :type)
         returning id;
     """)
     with engine.begin() as conn:
@@ -47,13 +50,14 @@ def insert_expense(
             "category": category,
             "description": description,
             "confidence": confidence,
+            "type": entry_type,
         }).first()
         return row[0] if row else None
 
 
 def get_chat_id_for_user(user_id: str) -> int | None:
     """
-    Pega o último chat_id conhecido do usuário (pode ser chat privado ou grupo).
+    Pega o último chat_id conhecido do usuário.
     """
     q = text("""
         select chat_id
@@ -76,19 +80,28 @@ def get_chat_id_for_user(user_id: str) -> int | None:
         return None
 
 
-def list_last_expenses(user_id: str, limit: int = 10):
+def list_last_entries(user_id: str, entry_type: str = "expense", limit: int = 10):
+    """
+    Lista ultimas entradas por tipo ('expense' ou 'income').
+    """
     q = text("""
         select created_at, amount, currency, category, description
         from public.expenses
         where user_id = :user_id
+          and coalesce(type, 'expense') = :type
         order by created_at desc
         limit :limit;
     """)
     with engine.begin() as conn:
-        return conn.execute(q, {"user_id": user_id, "limit": limit}).fetchall()
+        return conn.execute(q, {"user_id": user_id, "type": entry_type, "limit": limit}).fetchall()
 
 
-def totals_by_category(user_id: str, start_dt: datetime, end_dt: datetime):
+# Alias para retrocompatibilidade
+def list_last_expenses(user_id: str, limit: int = 10):
+    return list_last_entries(user_id, entry_type="expense", limit=limit)
+
+
+def totals_by_category(user_id: str, start_dt: datetime, end_dt: datetime, entry_type: str = "expense"):
     q = text("""
         select category, coalesce(sum(amount), 0) as total, count(*) as n
         from public.expenses
@@ -96,32 +109,38 @@ def totals_by_category(user_id: str, start_dt: datetime, end_dt: datetime):
           and created_at >= :start_dt
           and created_at < :end_dt
           and amount is not null
+          and coalesce(type, 'expense') = :type
         group by category
         order by total desc;
     """)
     with engine.begin() as conn:
-        return conn.execute(q, {"user_id": user_id, "start_dt": start_dt, "end_dt": end_dt}).fetchall()
+        return conn.execute(q, {
+            "user_id": user_id, "start_dt": start_dt, "end_dt": end_dt, "type": entry_type,
+        }).fetchall()
 
 
-def totals_overall(user_id: str, start_dt: datetime, end_dt: datetime):
+def totals_overall(user_id: str, start_dt: datetime, end_dt: datetime, entry_type: str = "expense"):
     q = text("""
         select coalesce(sum(amount), 0) as total, count(*) as n
         from public.expenses
         where user_id = :user_id
           and created_at >= :start_dt
           and created_at < :end_dt
-          and amount is not null;
+          and amount is not null
+          and coalesce(type, 'expense') = :type;
     """)
     with engine.begin() as conn:
-        row = conn.execute(q, {"user_id": user_id, "start_dt": start_dt, "end_dt": end_dt}).first()
+        row = conn.execute(q, {
+            "user_id": user_id, "start_dt": start_dt, "end_dt": end_dt, "type": entry_type,
+        }).first()
         if not row:
             return 0, 0
         return row[0], row[1]
 
 
-def daily_totals_last_n_days(user_id: str, days: int, start_dt: datetime, end_dt: datetime):
+def daily_totals_last_n_days(user_id: str, days: int, start_dt: datetime, end_dt: datetime, entry_type: str = "expense"):
     """
-    Retorna totais por dia no intervalo [start_dt, end_dt), limitado a 'days' como segurança.
+    Retorna totais por dia no intervalo [start_dt, end_dt).
     """
     q = text("""
         select date_trunc('day', created_at) as day, coalesce(sum(amount), 0) as total
@@ -130,6 +149,7 @@ def daily_totals_last_n_days(user_id: str, days: int, start_dt: datetime, end_dt
           and created_at >= :start_dt
           and created_at < :end_dt
           and amount is not null
+          and coalesce(type, 'expense') = :type
         group by 1
         order by 1 asc
         limit :days;
@@ -139,7 +159,58 @@ def daily_totals_last_n_days(user_id: str, days: int, start_dt: datetime, end_dt
             "user_id": user_id,
             "start_dt": start_dt,
             "end_dt": end_dt,
-            "days": days
+            "days": days,
+            "type": entry_type,
+        }).fetchall()
+
+
+def monthly_balance(user_id: str, start_dt: datetime, end_dt: datetime):
+    """
+    Retorna (total_gastos, n_gastos, total_ganhos, n_ganhos) no periodo.
+    """
+    q = text("""
+        select
+            coalesce(sum(case when coalesce(type, 'expense') = 'expense' then amount end), 0) as total_expense,
+            count(case when coalesce(type, 'expense') = 'expense' then 1 end) as n_expense,
+            coalesce(sum(case when type = 'income' then amount end), 0) as total_income,
+            count(case when type = 'income' then 1 end) as n_income
+        from public.expenses
+        where user_id = :user_id
+          and created_at >= :start_dt
+          and created_at < :end_dt
+          and amount is not null;
+    """)
+    with engine.begin() as conn:
+        row = conn.execute(q, {"user_id": user_id, "start_dt": start_dt, "end_dt": end_dt}).first()
+        if not row:
+            return 0, 0, 0, 0
+        return row[0], row[1], row[2], row[3]
+
+
+def weekly_balance_last_n_weeks(user_id: str, weeks: int, start_dt: datetime, end_dt: datetime):
+    """
+    Retorna gastos e ganhos agrupados por semana para o grafico de balanco.
+    """
+    q = text("""
+        select
+            date_trunc('week', created_at) as week,
+            coalesce(sum(case when coalesce(type, 'expense') = 'expense' then amount end), 0) as expenses,
+            coalesce(sum(case when type = 'income' then amount end), 0) as income
+        from public.expenses
+        where user_id = :user_id
+          and created_at >= :start_dt
+          and created_at < :end_dt
+          and amount is not null
+        group by 1
+        order by 1 asc
+        limit :weeks;
+    """)
+    with engine.begin() as conn:
+        return conn.execute(q, {
+            "user_id": user_id,
+            "start_dt": start_dt,
+            "end_dt": end_dt,
+            "weeks": weeks,
         }).fetchall()
 
 

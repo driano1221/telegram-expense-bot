@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 import httpx
 import matplotlib.pyplot as plt
+import numpy as np
 
 from telegram import Update
 from telegram.ext import (
@@ -29,9 +30,12 @@ load_dotenv()
 from db import (
     insert_expense,
     list_last_expenses,
+    list_last_entries,
     totals_by_category,
     totals_overall,
     daily_totals_last_n_days,
+    monthly_balance,
+    weekly_balance_last_n_weeks,
     list_users_with_expenses,
     get_chat_id_for_user,
 )
@@ -83,17 +87,20 @@ MAX_TEXT_LENGTH = 500
 MAX_AMOUNT = 1_000_000  # R$ 1 milhão
 
 SYSTEM_PROMPT = """
-Você é um extrator de despesas em português do Brasil.
+Você é um extrator de despesas e ganhos financeiros em português do Brasil.
 Dada uma mensagem, devolva APENAS um JSON válido (sem texto extra) com:
 {
+  "type": "expense" | "income",
   "amount": number | null,
   "currency": "BRL",
-  "category": "alimentacao"|"transporte"|"saude"|"lazer"|"casa"|"outros",
+  "category": "alimentacao"|"transporte"|"saude"|"lazer"|"casa"|"salario"|"freelance"|"investimento"|"outros",
   "description": string,
   "confidence": number
 }
 Regras:
-- Se não houver gasto claro, amount=null, category="outros" e confidence baixa.
+- Se a mensagem indicar dinheiro RECEBIDO (salário, pagamento, venda, freelance, transferência recebida, investimento), type="income".
+- Se a mensagem indicar dinheiro GASTO (compra, pagamento de conta, despesa), type="expense".
+- Se não houver valor claro, amount=null, category="outros" e confidence baixa.
 - description deve ser curta (2 a 6 palavras).
 - currency sempre "BRL".
 """
@@ -143,21 +150,55 @@ async def extract_expense(text: str) -> dict:
     content = data["choices"][0]["message"]["content"]
     return json.loads(content)
 
+CATEGORY_EMOJI = {
+    "alimentacao": "🍔",
+    "transporte": "🚗",
+    "saude": "💊",
+    "lazer": "🎮",
+    "casa": "🏠",
+    "salario": "💼",
+    "freelance": "💻",
+    "investimento": "📈",
+    "outros": "📦",
+}
+
 def format_reply(obj: dict) -> str:
     amount = obj.get("amount")
     category = obj.get("category", "outros")
-    desc = (obj.get("description") or "").strip() or "Gasto"
+    entry_type = obj.get("type", "expense")
+    desc = (obj.get("description") or "").strip() or ("Gasto" if entry_type == "expense" else "Ganho")
     conf = float(obj.get("confidence") or 0)
+    emoji = CATEGORY_EMOJI.get(category, "📦")
 
     if amount is None:
-        return f"Não entendi como gasto 😅\nTenta: `gastei 50 no uber` (conf={conf:.2f})"
+        return (
+            "😅 <b>Não entendi</b>\n\n"
+            "Tenta algo como:\n"
+            "  <code>gastei 50 no uber</code>\n"
+            "  <code>recebi 3000 de salario</code>"
+        )
 
-    return f"✅ {format_brl(amount)} em *{category}* — {desc}"
+    if entry_type == "income":
+        return (
+            f"🟢 <b>Ganho registrado!</b>\n"
+            f"\n"
+            f"💰 Valor: <b>{format_brl(amount)}</b>\n"
+            f"{emoji} Categoria: <b>{category}</b>\n"
+            f"📝 Descrição: <i>{desc}</i>"
+        )
 
-async def safe_send_markdown(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+    return (
+        f"🔴 <b>Gasto registrado!</b>\n"
+        f"\n"
+        f"💰 Valor: <b>{format_brl(amount)}</b>\n"
+        f"{emoji} Categoria: <b>{category}</b>\n"
+        f"📝 Descrição: <i>{desc}</i>"
+    )
+
+async def safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
     for attempt, delay in enumerate([1, 2, 4], start=1):
         try:
-            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
             return
         except (NetworkError, TimedOut) as e:
             logger.warning("Falha ao enviar msg (tentativa %s): %s", attempt, e)
@@ -192,20 +233,32 @@ def build_report_text(user_id: str) -> str:
     week_rows = totals_by_category(user_id, w_start, w_end)
 
     lines = []
-    lines.append(f"📅 *Hoje* ({d_start.strftime('%d/%m')}): {format_brl(day_total)} em {day_n} gasto(s)")
+
+    # ── Hoje ──
+    lines.append(f"📅 <b>Hoje</b> ({d_start.strftime('%d/%m')})")
+    lines.append(f"    💰 Total: <b>{format_brl(day_total)}</b>  •  {day_n} gasto(s)")
+    lines.append("")
     if day_rows:
         for cat, total, n in day_rows[:8]:
-            lines.append(f"  • {cat}: {format_brl(total)} ({n})")
+            emoji = CATEGORY_EMOJI.get(cat, "📦")
+            lines.append(f"    {emoji} {cat}: <code>{format_brl(total)}</code> ({n})")
     else:
-        lines.append("  • (sem gastos hoje)")
+        lines.append("    <i>Nenhum gasto hoje</i>")
 
     lines.append("")
-    lines.append(f"🗓️ *Semana* (desde {w_start.strftime('%d/%m')}): {format_brl(week_total)} em {week_n} gasto(s)")
+    lines.append("─────────────────────")
+    lines.append("")
+
+    # ── Semana ──
+    lines.append(f"🗓 <b>Semana</b> (desde {w_start.strftime('%d/%m')})")
+    lines.append(f"    💰 Total: <b>{format_brl(week_total)}</b>  •  {week_n} gasto(s)")
+    lines.append("")
     if week_rows:
         for cat, total, n in week_rows[:8]:
-            lines.append(f"  • {cat}: {format_brl(total)} ({n})")
+            emoji = CATEGORY_EMOJI.get(cat, "📦")
+            lines.append(f"    {emoji} {cat}: <code>{format_brl(total)}</code> ({n})")
     else:
-        lines.append("  • (sem gastos na semana)")
+        lines.append("    <i>Nenhum gasto na semana</i>")
 
     return "\n".join(lines)
 
@@ -329,7 +382,6 @@ def build_daily_chart_png(user_id: str, days: int = 30) -> bytes:
         f"Total: {format_brl(total)}"
         f"   |   Media/dia: {format_brl(media)}"
         f"   |   Maior gasto: {format_brl(maior)}"
-        f"   |   Dias com gasto: {dias_com_gasto}/{len(x_all)}"
     )
     fig.text(
         0.5, 0.01, resumo,
@@ -350,16 +402,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_user.id):
         return
     msg = (
-        "Olá! Me manda uma frase tipo:\n"
-        "- gastei 50 no uber\n"
-        "- almocei 35 reais\n"
-        "- comprei remédio 120\n\n"
-        "Comandos:\n"
-        "/gastos — últimos 10\n"
-        "/relatorio — resumo hoje + semana\n"
-        "/grafico — gráfico últimos 30 dias"
+        "👋 <b>Olá! Eu sou seu bot de finanças.</b>\n"
+        "\n"
+        "Me manda uma frase tipo:\n"
+        "  <code>gastei 50 no uber</code>\n"
+        "  <code>almocei 35 reais</code>\n"
+        "  <code>recebi 3000 de salario</code>\n"
+        "\n"
+        "📋 <b>Comandos:</b>\n"
+        "  /gastos — últimos 10 gastos\n"
+        "  /ganhos — últimos 10 ganhos\n"
+        "  /relatorio — resumo hoje + semana\n"
+        "  /saldo — saldo do mês\n"
+        "  /grafico — gráfico de gastos (30 dias)\n"
+        "  /balanco — gráfico gastos x ganhos"
     )
-    await safe_send_markdown(context, update.effective_chat.id, msg)
+    await safe_send(context, update.effective_chat.id, msg)
 
 async def gastos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_user.id):
@@ -368,23 +426,29 @@ async def gastos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows = list_last_expenses(user_id=user_id, limit=10)
 
     if not rows:
-        await safe_send_markdown(context, update.effective_chat.id, "Ainda não tem gastos salvos.")
+        await safe_send(context, update.effective_chat.id, "📭 <i>Nenhum gasto registrado ainda.</i>")
         return
 
-    lines = []
-    for created_at, amount, currency, category, description in rows:
-        dt = str(created_at)[:19].replace("T", " ")
-        amt = f"{amount}".replace(".", ",") if amount is not None else "—"
-        lines.append(f"{dt} — R$ {amt} — {category} — {description}")
+    lines = ["📋 <b>Últimos gastos</b>\n"]
+    for i, (created_at, amount, currency, category, description) in enumerate(rows, 1):
+        dt = str(created_at)[:16].replace("T", " ")
+        emoji = CATEGORY_EMOJI.get(category, "📦")
+        lines.append(
+            f"{i}. {emoji} <b>{format_brl(amount)}</b> — {category}\n"
+            f"     <i>{description}</i>\n"
+            f"     🕐 <code>{dt}</code>"
+        )
+        if i < len(rows):
+            lines.append("")
 
-    await safe_send_markdown(context, update.effective_chat.id, "\n".join(lines))
+    await safe_send(context, update.effective_chat.id, "\n".join(lines))
 
 async def relatorio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_user.id):
         return
     user_id = str(update.effective_user.id)
     text = build_report_text(user_id)
-    await safe_send_markdown(context, update.effective_chat.id, text)
+    await safe_send(context, update.effective_chat.id, text)
 
 async def grafico(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_user.id):
@@ -401,10 +465,185 @@ async def teste23(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
 
     text = build_report_text(user_id)
-    await safe_send_markdown(context, chat_id, "🧪 *Teste do relatório (simulando 23:00)*\n" + text)
+    await safe_send(context, chat_id, "🧪 <b>Teste do relatório (simulando 23:00)</b>\n\n" + text)
 
     png = build_daily_chart_png(user_id, days=30)
     await safe_send_photo(context, chat_id, png, caption="📈 Gráfico (30 dias) — teste")
+
+async def ganhos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = str(update.effective_user.id)
+    rows = list_last_entries(user_id, entry_type="income", limit=10)
+
+    if not rows:
+        await safe_send(context, update.effective_chat.id, "📭 <i>Nenhum ganho registrado ainda.</i>")
+        return
+
+    lines = ["💚 <b>Últimos ganhos</b>\n"]
+    for i, (created_at, amount, currency, category, description) in enumerate(rows, 1):
+        dt = str(created_at)[:16].replace("T", " ")
+        emoji = CATEGORY_EMOJI.get(category, "📦")
+        lines.append(
+            f"{i}. {emoji} <b>{format_brl(amount)}</b> — {category}\n"
+            f"     <i>{description}</i>\n"
+            f"     🕐 <code>{dt}</code>"
+        )
+        if i < len(rows):
+            lines.append("")
+
+    await safe_send(context, update.effective_chat.id, "\n".join(lines))
+
+
+async def saldo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = str(update.effective_user.id)
+
+    d0 = now_local()
+    # Mes atual: dia 1 ate agora
+    m_start = d0.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    m_end = d0 + timedelta(days=1)
+
+    total_gastos, n_gastos, total_ganhos, n_ganhos = monthly_balance(user_id, m_start, m_end)
+    saldo_val = float(total_ganhos) - float(total_gastos)
+
+    if saldo_val >= 0:
+        saldo_icon = "🟢"
+        saldo_label = "positivo"
+    else:
+        saldo_icon = "🔴"
+        saldo_label = "negativo"
+
+    mes_nome = d0.strftime("%B/%Y").capitalize()
+
+    text = (
+        f"💰 <b>Saldo de {mes_nome}</b>\n"
+        f"\n"
+        f"🟢 Ganhos: <b>{format_brl(total_ganhos)}</b>  ({n_ganhos} registro(s))\n"
+        f"🔴 Gastos: <b>{format_brl(total_gastos)}</b>  ({n_gastos} registro(s))\n"
+        f"\n"
+        f"─────────────────────\n"
+        f"\n"
+        f"{saldo_icon} Saldo: <b>{format_brl(abs(saldo_val))}</b> {saldo_label}"
+    )
+    await safe_send(context, update.effective_chat.id, text)
+
+
+def build_balance_chart_png(user_id: str, weeks: int = 8) -> bytes:
+    """Grafico de barras: gastos x ganhos por semana + linha de saldo."""
+    end = now_local()
+    start = (end - timedelta(weeks=weeks)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    rows = weekly_balance_last_n_weeks(user_id, weeks=weeks + 2, start_dt=start, end_dt=end)
+
+    week_labels = []
+    expenses = []
+    incomes = []
+    for row in rows:
+        week_labels.append(row[0].strftime("%d/%m"))
+        expenses.append(float(row[1] or 0))
+        incomes.append(float(row[2] or 0))
+
+    # Cores
+    COLOR_EXPENSE = "#EF4444"
+    COLOR_INCOME = "#22C55E"
+    COLOR_BALANCE = "#2563EB"
+    COLOR_GRID = "#E5E7EB"
+    COLOR_TEXT = "#374151"
+    BG_COLOR = "#FAFBFC"
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    fig.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+
+    if not week_labels:
+        ax.text(0.5, 0.5, "Sem dados ainda", ha="center", va="center",
+                fontsize=14, color=COLOR_TEXT, transform=ax.transAxes)
+        bio = BytesIO()
+        fig.savefig(bio, format="png", dpi=180, facecolor=BG_COLOR)
+        plt.close(fig)
+        return bio.getvalue()
+
+    x = np.arange(len(week_labels))
+    width = 0.35
+
+    # Barras
+    bars_exp = ax.bar(x - width/2, expenses, width, label="Gastos", color=COLOR_EXPENSE, alpha=0.85, zorder=3)
+    bars_inc = ax.bar(x + width/2, incomes, width, label="Ganhos", color=COLOR_INCOME, alpha=0.85, zorder=3)
+
+    # Linha de saldo
+    balances = [inc - exp for inc, exp in zip(incomes, expenses)]
+    ax.plot(x, balances, color=COLOR_BALANCE, linewidth=2.5, marker="o", markersize=6,
+            label="Saldo", zorder=4, markeredgecolor="white", markeredgewidth=1.5)
+
+    # Rotulos nas barras
+    for bar in bars_exp:
+        h = bar.get_height()
+        if h > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, h, format_brl(h),
+                    ha="center", va="bottom", fontsize=7, color=COLOR_EXPENSE, fontweight="bold")
+
+    for bar in bars_inc:
+        h = bar.get_height()
+        if h > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, h, format_brl(h),
+                    ha="center", va="bottom", fontsize=7, color=COLOR_INCOME, fontweight="bold")
+
+    # Rotulos de saldo
+    for i, bal in enumerate(balances):
+        offset = 12 if bal >= 0 else -12
+        ax.annotate(
+            format_brl(bal),
+            (x[i], bal),
+            textcoords="offset points", xytext=(0, offset),
+            ha="center", fontsize=7, fontweight="bold", color=COLOR_BALANCE,
+        )
+
+    # Estilo
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"Sem.\n{l}" for l in week_labels], fontsize=8)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, pos: format_brl(v)))
+    ax.axhline(y=0, color=COLOR_GRID, linewidth=1, zorder=1)
+    ax.grid(True, axis="y", linestyle="-", linewidth=0.5, color=COLOR_GRID, alpha=0.8)
+    ax.grid(False, axis="x")
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.spines["bottom"].set_color(COLOR_GRID)
+    ax.tick_params(axis="both", which="both", length=0, labelcolor=COLOR_TEXT, labelsize=9)
+
+    ax.set_title(
+        f"Gastos x Ganhos — ultimas {weeks} semanas",
+        fontsize=14, fontweight="bold", color=COLOR_TEXT, pad=16, loc="left",
+    )
+
+    ax.legend(loc="upper left", frameon=False, fontsize=10)
+
+    # Resumo
+    total_exp = sum(expenses)
+    total_inc = sum(incomes)
+    saldo_total = total_inc - total_exp
+    resumo = f"Total gastos: {format_brl(total_exp)}   |   Total ganhos: {format_brl(total_inc)}   |   Saldo: {format_brl(saldo_total)}"
+    fig.text(0.5, 0.01, resumo, ha="center", fontsize=9, color=COLOR_TEXT, alpha=0.7, style="italic")
+
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.15)
+
+    bio = BytesIO()
+    fig.savefig(bio, format="png", dpi=180, facecolor=BG_COLOR, edgecolor="none")
+    plt.close(fig)
+    return bio.getvalue()
+
+
+async def balanco(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = str(update.effective_user.id)
+    png = build_balance_chart_png(user_id, weeks=8)
+    await safe_send_photo(context, update.effective_chat.id, png, caption="📊 Gastos x Ganhos (8 semanas)")
+
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text_in = update.message.text or ""
@@ -419,7 +658,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ── Rate limiting ──
     if is_rate_limited(uid):
-        await safe_send_markdown(
+        await safe_send(
             context, update.effective_chat.id,
             "⏳ Calma! Limite de mensagens atingido. Tente novamente em alguns segundos.",
         )
@@ -427,7 +666,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ── Validacao de tamanho ──
     if len(text_in) > MAX_TEXT_LENGTH:
-        await safe_send_markdown(
+        await safe_send(
             context, update.effective_chat.id,
             f"Mensagem muito longa ({len(text_in)} chars). Máximo: {MAX_TEXT_LENGTH}.",
         )
@@ -456,6 +695,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             user_id = str(uid)
             chat_id = str(update.effective_chat.id)
 
+            entry_type = obj.get("type", "expense")
+            if entry_type not in ("expense", "income"):
+                entry_type = "expense"
+
             insert_expense(
                 user_id=user_id,
                 chat_id=chat_id,
@@ -465,6 +708,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 category=obj.get("category") or "outros",
                 description=obj.get("description") or "",
                 confidence=float(obj.get("confidence") or 0),
+                entry_type=entry_type,
             )
 
     except httpx.HTTPStatusError as e:
@@ -472,7 +716,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         reply = f"Deu erro: {type(e).__name__}: {e}"
 
-    await safe_send_markdown(context, update.effective_chat.id, reply)
+    await safe_send(context, update.effective_chat.id, reply)
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Erro no handler: %s", context.error)
@@ -492,10 +736,10 @@ async def scheduled_23h(context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
 
             text = build_report_text(uid)
-            await safe_send_markdown(
+            await safe_send(
                 context,
                 chat_id,
-                "🕚 *Relatório automático (23:00)*\n" + text
+                "🕚 <b>Relatório automático (23:00)</b>\n\n" + text
             )
 
             # opcional: manda gráfico também
@@ -518,7 +762,10 @@ def build_app() -> Application:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("gastos", gastos))
+    app.add_handler(CommandHandler("ganhos", ganhos))
     app.add_handler(CommandHandler("relatorio", relatorio))
+    app.add_handler(CommandHandler("saldo", saldo))
+    app.add_handler(CommandHandler("balanco", balanco))
     app.add_handler(CommandHandler("grafico", grafico))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CommandHandler("teste23", teste23))
