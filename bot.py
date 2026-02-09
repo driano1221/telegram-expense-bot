@@ -218,7 +218,7 @@ def build_daily_chart_png(user_id: str, days: int = 30) -> bytes:
     # mapa dia -> total
     totals_by_day = {r[0].date(): float(r[1] or 0) for r in rows}
 
-    # série completa (linha contínua)
+    # serie completa (linha continua)
     x_all = []
     y_all = []
     cur = start.date()
@@ -231,81 +231,117 @@ def build_daily_chart_png(user_id: str, days: int = 30) -> bytes:
     x_pts = [d for d in x_all if totals_by_day.get(d, 0.0) > 0]
     y_pts = [totals_by_day[d] for d in x_pts]
 
-    # --------- escolhe escala Y automaticamente ----------
+    # ── Cores e estilo ──
+    COLOR_LINE = "#2563EB"       # azul moderno
+    COLOR_FILL = "#2563EB"
+    COLOR_DOT = "#1D4ED8"
+    COLOR_GRID = "#E5E7EB"
+    COLOR_TEXT = "#374151"
+    COLOR_LABEL_BG = "#F0F4FF"
+    BG_COLOR = "#FAFBFC"
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    fig.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+
+    # ── Linha principal com area preenchida ──
+    ax.plot(x_all, y_all, linewidth=2.5, color=COLOR_LINE, zorder=3)
+    ax.fill_between(x_all, y_all, alpha=0.08, color=COLOR_FILL, zorder=2)
+
+    # ── Marcadores elegantes so onde tem gasto ──
+    if x_pts:
+        ax.scatter(x_pts, y_pts, s=30, color=COLOR_DOT, zorder=4, edgecolors="white", linewidths=1.5)
+
+    # ── Eixo Y: formato BRL ──
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: format_brl(x)))
+
+    # ── Grid sutil apenas horizontal ──
+    ax.grid(True, axis="y", linestyle="-", linewidth=0.5, color=COLOR_GRID, alpha=0.8)
+    ax.grid(False, axis="x")
+
+    # ── Remover bordas (spines) exceto inferior ──
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.spines["bottom"].set_color(COLOR_GRID)
+    ax.spines["bottom"].set_linewidth(0.8)
+
+    # ── Ticks limpos ──
+    ax.tick_params(axis="both", which="both", length=0, labelcolor=COLOR_TEXT, labelsize=9)
+
+    # ── Titulo minimalista ──
+    ax.set_title(
+        f"Gastos diarios — ultimos {days} dias",
+        fontsize=14, fontweight="bold", color=COLOR_TEXT,
+        pad=16, loc="left",
+    )
+
+    # ── Eixo X: mostrar mais datas ──
+    locator = mdates.AutoDateLocator(minticks=6, maxticks=15)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m"))
+    fig.autofmt_xdate(rotation=45, ha="right")
+
+    # ── Escala Y ──
     positives = sorted([v for v in y_all if v > 0])
-    use_symlog = False
-    linthresh = 10  # até R$10 fica "linear" (ajuste se quiser)
     if positives:
-        # Se o maior for muito maior que a mediana, tem "pico"
         median = positives[len(positives) // 2]
         vmax = positives[-1]
         if median > 0 and (vmax / median) >= 8:
-            use_symlog = True
-
-    fig, ax = plt.subplots(figsize=(12, 4.5))
-
-    # Linha
-    ax.plot(x_all, y_all, linewidth=2)
-
-    # Marcadores só onde tem gasto
-    if x_pts:
-        ax.plot(x_pts, y_pts, linestyle="None", marker="o", markersize=5)
-
-    # Formatação BRL no eixo Y
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: format_brl(x)))
-
-    ax.set_title(f"Gastos por dia (últimos {days} dias)")
-    ax.set_xlabel("Dia")
-    ax.set_ylabel("Valor (R$)")
-    ax.grid(True, axis="y", linestyle="--", linewidth=0.7, alpha=0.6)
-
-    # Eixo X: datas legíveis (sem colar)
-    locator = mdates.AutoDateLocator(minticks=5, maxticks=8)
-    formatter = mdates.ConciseDateFormatter(locator)
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(formatter)
-    fig.autofmt_xdate(rotation=0)
-
-    # Escala "symlog" se houver pico (melhor visualização)
-    if use_symlog:
-        ax.set_yscale("symlog", linthresh=linthresh)
-        ax.text(
-            0.99, 0.95,
-            f"Escala ajustada (symlog) p/ mostrar picos",
-            transform=ax.transAxes,
-            ha="right", va="top",
-            fontsize=9,
-        )
-    else:
-        # sem pico: usa limite confortável
-        if positives:
-            ax.set_ylim(0, positives[-1] * 1.15)
+            ax.set_yscale("symlog", linthresh=10)
         else:
-            ax.set_ylim(0, 1)
+            ax.set_ylim(0, vmax * 1.2)
+    else:
+        ax.set_ylim(0, 1)
 
-    # Rótulos: só nos pontos mais relevantes (pra não poluir)
-    # - mostra no máximo 6 rótulos
-    # - prioriza valores maiores
+    # ── Rotulos nos top 5 valores ──
     if x_pts:
         pairs = list(zip(x_pts, y_pts))
         pairs_sorted = sorted(pairs, key=lambda t: t[1], reverse=True)
-        to_label = pairs_sorted[:6]
+        to_label = pairs_sorted[:5]
 
         for xd, yd in to_label:
             ax.annotate(
                 format_brl(yd),
                 (xd, yd),
                 textcoords="offset points",
-                xytext=(0, 10),
+                xytext=(0, 12),
                 ha="center",
-                fontsize=9,
-                bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.8),
+                fontsize=8,
+                fontweight="bold",
+                color=COLOR_TEXT,
+                bbox=dict(
+                    boxstyle="round,pad=0.3",
+                    fc=COLOR_LABEL_BG,
+                    ec=COLOR_LINE,
+                    linewidth=0.6,
+                    alpha=0.9,
+                ),
             )
 
+    # ── Resumo no rodape ──
+    total = sum(y_all)
+    dias_com_gasto = len([v for v in y_all if v > 0])
+    media = total / dias_com_gasto if dias_com_gasto > 0 else 0
+    maior = max(y_all) if y_all else 0
+
+    resumo = (
+        f"Total: {format_brl(total)}"
+        f"   |   Media/dia: {format_brl(media)}"
+        f"   |   Maior gasto: {format_brl(maior)}"
+        f"   |   Dias com gasto: {dias_com_gasto}/{len(x_all)}"
+    )
+    fig.text(
+        0.5, 0.01, resumo,
+        ha="center", fontsize=9, color=COLOR_TEXT, alpha=0.7,
+        style="italic",
+    )
+
     fig.tight_layout()
+    fig.subplots_adjust(bottom=0.13)
 
     bio = BytesIO()
-    fig.savefig(bio, format="png", dpi=180)
+    fig.savefig(bio, format="png", dpi=180, facecolor=BG_COLOR, edgecolor="none")
     plt.close(fig)
     return bio.getvalue()
 
