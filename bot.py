@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import logging
+from collections import defaultdict
 from io import BytesIO
 from datetime import datetime, timedelta
 import pytz
@@ -49,6 +50,37 @@ if not GROQ_API_KEY:
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = "llama-3.3-70b-versatile"
+
+# ── Rate limiting ──────────────────────────────────────────────
+RATE_LIMIT_MSGS = int(os.getenv("RATE_LIMIT_MSGS", "5"))   # msgs por janela
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # janela em segundos
+_user_timestamps: dict[int, list[float]] = defaultdict(list)
+
+def is_rate_limited(user_id: int) -> bool:
+    now = time.time()
+    window_start = now - RATE_LIMIT_WINDOW
+    timestamps = _user_timestamps[user_id]
+    _user_timestamps[user_id] = [t for t in timestamps if t > window_start]
+    if len(_user_timestamps[user_id]) >= RATE_LIMIT_MSGS:
+        return True
+    _user_timestamps[user_id].append(now)
+    return False
+
+# ── Allowlist de usuarios ─────────────────────────────────────
+_allowed_env = os.getenv("ALLOWED_USERS", "").strip()
+ALLOWED_USERS: set[int] | None = (
+    {int(uid.strip()) for uid in _allowed_env.split(",") if uid.strip()}
+    if _allowed_env else None  # None = qualquer um pode usar
+)
+
+def is_allowed(user_id: int) -> bool:
+    if ALLOWED_USERS is None:
+        return True
+    return user_id in ALLOWED_USERS
+
+# ── Validacao de entrada ──────────────────────────────────────
+MAX_TEXT_LENGTH = 500
+MAX_AMOUNT = 1_000_000  # R$ 1 milhão
 
 SYSTEM_PROMPT = """
 Você é um extrator de despesas em português do Brasil.
@@ -199,10 +231,6 @@ def build_daily_chart_png(user_id: str, days: int = 30) -> bytes:
     x_pts = [d for d in x_all if totals_by_day.get(d, 0.0) > 0]
     y_pts = [totals_by_day[d] for d in x_pts]
 
-    def fmt_brl(v: float) -> str:
-        s = f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        return f"R$ {s}"
-
     # --------- escolhe escala Y automaticamente ----------
     positives = sorted([v for v in y_all if v > 0])
     use_symlog = False
@@ -224,7 +252,7 @@ def build_daily_chart_png(user_id: str, days: int = 30) -> bytes:
         ax.plot(x_pts, y_pts, linestyle="None", marker="o", markersize=5)
 
     # Formatação BRL no eixo Y
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: fmt_brl(x)))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: format_brl(x)))
 
     ax.set_title(f"Gastos por dia (últimos {days} dias)")
     ax.set_xlabel("Dia")
@@ -265,7 +293,7 @@ def build_daily_chart_png(user_id: str, days: int = 30) -> bytes:
 
         for xd, yd in to_label:
             ax.annotate(
-                fmt_brl(yd),
+                format_brl(yd),
                 (xd, yd),
                 textcoords="offset points",
                 xytext=(0, 10),
@@ -283,6 +311,8 @@ def build_daily_chart_png(user_id: str, days: int = 30) -> bytes:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update.effective_user.id):
+        return
     msg = (
         "Olá! Me manda uma frase tipo:\n"
         "- gastei 50 no uber\n"
@@ -296,6 +326,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_send_markdown(context, update.effective_chat.id, msg)
 
 async def gastos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update.effective_user.id):
+        return
     user_id = str(update.effective_user.id)
     rows = list_last_expenses(user_id=user_id, limit=10)
 
@@ -312,14 +344,19 @@ async def gastos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_send_markdown(context, update.effective_chat.id, "\n".join(lines))
 
 async def relatorio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update.effective_user.id):
+        return
     user_id = str(update.effective_user.id)
     text = build_report_text(user_id)
     await safe_send_markdown(context, update.effective_chat.id, text)
 
 async def grafico(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update.effective_user.id):
+        return
     user_id = str(update.effective_user.id)
     png = build_daily_chart_png(user_id, days=30)
     await safe_send_photo(context, update.effective_chat.id, png, caption="📈 Gastos por dia (30 dias)")
+
 async def teste23(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Dispara manualmente o mesmo relatório automático das 23:00 (pra teste).
@@ -338,26 +375,61 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not text_in.strip():
         return
 
+    uid = update.effective_user.id
+
+    # ── Allowlist ──
+    if not is_allowed(uid):
+        return  # ignora silenciosamente
+
+    # ── Rate limiting ──
+    if is_rate_limited(uid):
+        await safe_send_markdown(
+            context, update.effective_chat.id,
+            "⏳ Calma! Limite de mensagens atingido. Tente novamente em alguns segundos.",
+        )
+        return
+
+    # ── Validacao de tamanho ──
+    if len(text_in) > MAX_TEXT_LENGTH:
+        await safe_send_markdown(
+            context, update.effective_chat.id,
+            f"Mensagem muito longa ({len(text_in)} chars). Máximo: {MAX_TEXT_LENGTH}.",
+        )
+        return
+
     try:
         obj = await extract_expense(text_in)
+
+        # ── Validacao do amount retornado pela LLM ──
+        amount = obj.get("amount")
+        if amount is not None:
+            try:
+                amount = float(amount)
+                if amount <= 0 or amount > MAX_AMOUNT:
+                    obj["amount"] = None
+                    obj["confidence"] = 0
+                else:
+                    obj["amount"] = amount
+            except (ValueError, TypeError):
+                obj["amount"] = None
+                obj["confidence"] = 0
+
         reply = format_reply(obj)
 
         if obj.get("amount") is not None:
-            user_id = str(update.effective_user.id)
+            user_id = str(uid)
             chat_id = str(update.effective_chat.id)
 
-            expense_id = insert_expense(
+            insert_expense(
                 user_id=user_id,
                 chat_id=chat_id,
                 raw_text=text_in,
-                amount=obj.get("amount"),
+                amount=obj["amount"],
                 currency=obj.get("currency") or "BRL",
                 category=obj.get("category") or "outros",
                 description=obj.get("description") or "",
                 confidence=float(obj.get("confidence") or 0),
             )
-
-            reply = reply
 
     except httpx.HTTPStatusError as e:
         reply = f"Erro na Groq (status {e.response.status_code}).\nTrecho: {e.response.text[:300]}"
@@ -418,9 +490,10 @@ def build_app() -> Application:
     app.add_error_handler(on_error)
 
     # Agenda job diário às 23:00 no fuso de SP
+    from datetime import time as dt_time
     app.job_queue.run_daily(
         scheduled_23h,
-        time=datetime.now(TZ).replace(hour=23, minute=0, second=0, microsecond=0).time(),
+        time=dt_time(hour=23, minute=0, second=0, tzinfo=TZ),
         name="relatorio_23h",
     )
 
