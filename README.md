@@ -1,5 +1,4 @@
-
-<img width="1536" height="1024" alt="ChatGPT Image 6 de fev  de 2026, 17_55_53" src="https://github.com/user-attachments/assets/0deecabf-a84b-4238-8483-fe355f3d0076" />
+<img width="2528" height="1696" alt="Gemini_Generated_Image_rkg2dxrkg2dxrkg2" src="https://github.com/user-attachments/assets/6de0f2b9-71a2-4759-8a15-1e11c0084f19" />
 
 
 # Telegram Finance Bot (PT-BR) — Groq + Supabase + Koyeb (Totalmente Gratuito)
@@ -96,7 +95,7 @@ O parsing do texto e feito via Groq (modelo Llama), retornando **apenas JSON**, 
 - No Koyeb, o servico roda como Web Service e expoe `/healthz`
 - UptimeRobot pode pingar `/healthz` para evitar sleep em plano free
 
-<img width="2816" height="1536" alt="Gemini_Generated_Image_nkkrcdnkkrcdnkkr" src="https://github.com/user-attachments/assets/8e4aa545-c22e-4947-80d3-5e1e4514553e" />
+<img width="2816" height="1504" alt="Gemini_Generated_Image_y31kary31kary31k" src="https://github.com/user-attachments/assets/31c3e9a5-987c-4f74-ba04-a2187aa41d25" />
 
 ---
 
