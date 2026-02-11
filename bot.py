@@ -405,6 +405,8 @@ async def teste23(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Dispara manualmente o mesmo relatório automático das 23:00 (pra teste).
     """
+    if not is_allowed(update.effective_user.id):
+        return
     user_id = str(update.effective_user.id)
     chat_id = update.effective_chat.id
 
@@ -774,6 +776,7 @@ def build_app() -> Application:
     )
 
     return app
+
 def start_health_server():
     port = int(os.getenv("PORT", "8080"))
 
