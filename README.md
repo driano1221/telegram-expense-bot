@@ -28,6 +28,13 @@ Bot de Telegram para registrar despesas a partir de mensagens em português, ger
 
 ---
 
+## 🚀 Atualizações Recentes (11/02/2026)
+
+- ✅ **Botões de Confirmação:** O bot agora solicita confirmação (Confirmar/Cancelar) antes de salvar registros no banco de dados.
+- ✅ **Comando /remover:** Permite apagar o último registro feito (gasto ou ganho) de forma rápida.
+
+---
+
 ## Visão geral
 
 Este projeto implementa um bot de Telegram que interpreta mensagens do tipo “gastei 50 no Uber” e transforma isso em um registro estruturado no banco (Postgres/Supabase). Além disso, oferece:

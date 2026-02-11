@@ -230,3 +230,22 @@ def list_users_with_expenses(only_with_chat_id: bool = True):
 
     with engine.begin() as conn:
         return [r[0] for r in conn.execute(q).fetchall()]
+
+
+def delete_last_entry(user_id: str):
+    """
+    Remove o último registro (gasto ou ganho) do usuário.
+    Retorna os dados do item removido para confirmação.
+    """
+    q = text("""
+        delete from public.expenses
+        where id = (
+            select id from public.expenses
+            where user_id = :user_id
+            order by created_at desc
+            limit 1
+        )
+        returning amount, category, description, type;
+    """)
+    with engine.begin() as conn:
+        return conn.execute(q, {"user_id": user_id}).first()

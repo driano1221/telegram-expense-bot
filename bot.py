@@ -16,9 +16,9 @@ import httpx
 import matplotlib.pyplot as plt
 import numpy as np
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, MessageHandler, CommandHandler, ContextTypes, filters
+    Application, MessageHandler, CommandHandler, ContextTypes, filters, CallbackQueryHandler
 )
 from telegram.error import NetworkError, TimedOut
 from telegram.request import HTTPXRequest
@@ -37,6 +37,7 @@ from db import (
     weekly_balance_last_n_weeks,
     list_users_with_expenses,
     get_chat_id_for_user,
+    delete_last_entry,
 )
 from utils import (
     TZ,
@@ -357,7 +358,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /relatorio — resumo hoje + semana\n"
         "  /saldo — saldo do mês\n"
         "  /grafico — gráfico de gastos (30 dias)\n"
-        "  /balanco — gráfico gastos x ganhos"
+        "  /balanco — gráfico gastos x ganhos\n"
+        "  /remover — apaga o último registro"
     )
     await safe_send(context, update.effective_chat.id, msg)
 
@@ -594,11 +596,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     uid = update.effective_user.id
 
-    # ── Allowlist ──
     if not is_allowed(uid):
-        return  # ignora silenciosamente
+        return
 
-    # ── Rate limiting ──
     if is_rate_limited(uid):
         await safe_send(
             context, update.effective_chat.id,
@@ -606,7 +606,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # ── Validacao de tamanho ──
     if len(text_in) > MAX_TEXT_LENGTH:
         await safe_send(
             context, update.effective_chat.id,
@@ -616,49 +615,99 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         obj = await extract_expense(text_in)
-
-        # ── Validacao do amount retornado pela LLM ──
         amount = obj.get("amount")
+
         if amount is not None:
             try:
                 amount = float(amount)
                 if amount <= 0 or amount > MAX_AMOUNT:
                     obj["amount"] = None
-                    obj["confidence"] = 0
                 else:
                     obj["amount"] = amount
             except (ValueError, TypeError):
                 obj["amount"] = None
-                obj["confidence"] = 0
 
-        reply = format_reply(obj)
+        if obj.get("amount") is None:
+            await safe_send(context, update.effective_chat.id, format_reply(obj))
+            return
 
-        if obj.get("amount") is not None:
-            user_id = str(uid)
-            chat_id = str(update.effective_chat.id)
+        # Armazena para confirmacao
+        context.user_data["pending"] = {
+            "obj": obj,
+            "raw_text": text_in,
+            "chat_id": str(update.effective_chat.id)
+        }
 
-            entry_type = obj.get("type", "expense")
-            if entry_type not in ("expense", "income"):
-                entry_type = "expense"
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Confirmar", callback_data="conf_yes"),
+                InlineKeyboardButton("❌ Cancelar", callback_data="conf_no"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
-            insert_expense(
-                user_id=user_id,
-                chat_id=chat_id,
-                raw_text=text_in,
-                amount=obj["amount"],
-                currency=obj.get("currency") or "BRL",
-                category=obj.get("category") or "outros",
-                description=obj.get("description") or "",
-                confidence=float(obj.get("confidence") or 0),
-                entry_type=entry_type,
-            )
+        await update.message.reply_html(
+            format_reply(obj) + "\n\n<b>Deseja salvar?</b>",
+            reply_markup=reply_markup
+        )
 
-    except httpx.HTTPStatusError as e:
-        reply = f"Erro na Groq (status {e.response.status_code}).\nTrecho: {e.response.text[:300]}"
     except Exception as e:
-        reply = f"Deu erro: {type(e).__name__}: {e}"
+        logger.exception("Erro ao processar texto: %s", e)
+        await safe_send(context, update.effective_chat.id, f"❌ Erro: {type(e).__name__}")
 
-    await safe_send(context, update.effective_chat.id, reply)
+
+async def confirm_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    pending = context.user_data.get("pending")
+    if not pending:
+        await query.edit_message_text("⚠️ Nada pendente ou já expirou.")
+        return
+
+    if query.data == "conf_yes":
+        obj = pending["obj"]
+        user_id = str(update.effective_user.id)
+
+        insert_expense(
+            user_id=user_id,
+            chat_id=pending["chat_id"],
+            raw_text=pending["raw_text"],
+            amount=obj["amount"],
+            currency=obj.get("currency") or "BRL",
+            category=obj.get("category") or "outros",
+            description=obj.get("description") or "",
+            confidence=float(obj.get("confidence") or 0),
+            entry_type=obj.get("type", "expense"),
+        )
+        await query.edit_message_text(query.message.text_html + "\n\n✅ <b>Salvo com sucesso!</b>", parse_mode="HTML")
+    else:
+        await query.edit_message_text(query.message.text_html + "\n\n❌ <b>Cancelado.</b>", parse_mode="HTML")
+
+    context.user_data.pop("pending", None)
+
+
+async def remover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = str(update.effective_user.id)
+    removed = delete_last_entry(user_id)
+
+    if not removed:
+        await safe_send(context, update.effective_chat.id, "📭 <i>Nenhum registro encontrado para remover.</i>")
+        return
+
+    amount, category, description, entry_type = removed
+    tipo = "Gasto" if entry_type == "expense" else "Ganho"
+    msg = (
+        f"🗑️ <b>Registro removido!</b>\n\n"
+        f"Tipo: {tipo}\n"
+        f"Valor: {format_brl(amount)}\n"
+        f"Categoria: {category}\n"
+        f"Desc: <i>{description}</i>"
+    )
+    await safe_send(context, update.effective_chat.id, msg)
+
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Erro no handler: %s", context.error)
@@ -709,7 +758,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("saldo", saldo))
     app.add_handler(CommandHandler("balanco", balanco))
     app.add_handler(CommandHandler("grafico", grafico))
+    app.add_handler(CommandHandler("remover", remover))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(CallbackQueryHandler(confirm_btn, pattern="^conf_"))
     app.add_handler(CommandHandler("teste23", teste23))
 
     app.add_error_handler(on_error)
